@@ -2,280 +2,146 @@ pipeline {
 
     agent {
         docker {
-            image 'abhishekf5/maven-abhishek-docker-agent:v1'
-            args '--user root -v /var/run/docker.sock:/var/run/docker.sock'
+            // >>> CHANGE YOUR_DOCKERHUB_USER to your Docker Hub username <<<
+            image 'YOUR_DOCKERHUB_USER/maven-docker-agent:v1'
+            registryUrl 'https://index.docker.io/v1/'
+            registryCredentialsId 'docker-cred'   // lets Jenkins pull even if the repo is private
+            // --entrypoint='' : let Jenkins control the container (fixes ENTRYPOINT warning)
+            args "--user root --entrypoint='' -v /var/run/docker.sock:/var/run/docker.sock"
             reuseNode true
         }
     }
 
     environment {
-        // Application
-        APP_DIR = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app'
+        APP_DIR         = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app'
+        DEPLOYMENT_FILE = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml'
 
-        // SonarQube
+        // SonarQube - prefer the EC2 PRIVATE IP (run `hostname -I` on the EC2)
         SONAR_URL = 'http://13.203.76.118:9000'
 
-        // Docker
-        DOCKER_IMAGE = "abhishekf5/ultimate-cicd:${BUILD_NUMBER}"
+        // >>> CHANGE THIS to your own Docker Hub username <<<
+        DOCKERHUB_USER = 'YOUR_DOCKERHUB_USER'
+        DOCKER_IMAGE   = "${DOCKERHUB_USER}/ultimate-cicd:${BUILD_NUMBER}"
 
-        // GitHub
+        // GitHub (GitOps repo)
         GIT_REPO_NAME = 'Jenkins-Zero-To-Hero'
         GIT_USER_NAME = 'Affan2310'
     }
 
     stages {
 
-        // =========================================================
-        // 1. CHECKOUT
-        // =========================================================
         stage('Checkout') {
             steps {
-                echo "Checking out application source code..."
-
                 checkout([
                     $class: 'GitSCM',
                     branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/Affan2310/Jenkins-Zero-To-Hero.git'
-                    ]]
+                    userRemoteConfigs: [[url: "https://github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"]]
                 ])
-
                 sh '''
-                    echo "Current commit:"
+                    # Container runs as root, workspace is owned by jenkins -> trust it
+                    git config --global --add safe.directory '*'
                     git rev-parse --short HEAD
-
-                    echo "Repository contents:"
-                    ls -ltr
-
-                    echo "Application directory:"
-                    ls -ltr ${APP_DIR}
+                    java -version
+                    mvn -v
                 '''
             }
         }
 
-
-        // =========================================================
-        // 2. BUILD + UNIT TEST
-        // =========================================================
         stage('Build and Test') {
             steps {
                 sh '''
                     set -e
-
                     cd ${APP_DIR}
-
-                    echo "Cleaning previous Maven build..."
-                    mvn clean
-
-                    echo "Building application and running tests..."
-                    mvn package
-
-                    echo "Build completed successfully."
+                    mvn clean package
                 '''
             }
         }
 
-
-        // =========================================================
-        // 3. SONARQUBE STATIC CODE ANALYSIS
-        // =========================================================
         stage('Static Code Analysis') {
             steps {
-
-                withCredentials([
-                    string(
-                        credentialsId: 'sonarqube',
-                        variable: 'SONAR_AUTH_TOKEN'
-                    )
-                ]) {
-
+                withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_AUTH_TOKEN')]) {
                     sh '''
                         set -e
-
                         cd ${APP_DIR}
 
                         echo "Checking SonarQube connectivity..."
-
-                        curl -f ${SONAR_URL}/api/system/status
-
+                        if command -v curl >/dev/null 2>&1; then
+                            curl -s --max-time 10 ${SONAR_URL}/api/system/status || echo "WARN: SonarQube not reachable via curl"
+                        fi
                         echo ""
-                        echo "Running SonarQube analysis..."
 
                         mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
                           -Dsonar.host.url=${SONAR_URL} \
                           -Dsonar.token=${SONAR_AUTH_TOKEN}
-
-                        echo ""
-                        echo "SonarQube analysis completed successfully."
                     '''
                 }
             }
         }
 
-
-        // =========================================================
-        // 4. DOCKER BUILD
-        // =========================================================
         stage('Build Docker Image') {
             steps {
-
                 sh '''
                     set -e
-
                     cd ${APP_DIR}
-
-                    echo "Building Docker image:"
-                    echo "${DOCKER_IMAGE}"
-
-                    docker build \
-                        -t ${DOCKER_IMAGE} \
-                        .
-
-                    echo ""
-                    echo "Docker image created successfully."
-
-                    docker images | grep ultimate-cicd
-                '''
-            }
-        }
-
-
-        // =========================================================
-        // 5. DOCKER IMAGE CHECK
-        // =========================================================
-        stage('Docker Image Test') {
-            steps {
-
-                sh '''
-                    set -e
-
-                    echo "Inspecting Docker image..."
-
+                    docker build -t ${DOCKER_IMAGE} .
                     docker inspect ${DOCKER_IMAGE} > /dev/null
-
-                    echo "Docker image inspection successful."
                 '''
             }
         }
 
-
-        // =========================================================
-        // 6. PUSH IMAGE TO DOCKER HUB
-        // =========================================================
         stage('Push Docker Image') {
             steps {
-
                 script {
-
-                    echo "Pushing image: ${DOCKER_IMAGE}"
-
-                    docker.withRegistry(
-                        'https://index.docker.io/v1/',
-                        'docker-cred'
-                    ) {
-
-                        def dockerImage = docker.image("${DOCKER_IMAGE}")
-
-                        dockerImage.push()
-
-                        echo "Docker image pushed successfully."
+                    docker.withRegistry('https://index.docker.io/v1/', 'docker-cred') {
+                        docker.image("${DOCKER_IMAGE}").push()
                     }
                 }
             }
         }
 
-
-        // =========================================================
-        // 7. UPDATE GITOPS DEPLOYMENT
-        // =========================================================
         stage('Update Deployment File') {
             steps {
-
-                withCredentials([
-                    string(
-                        credentialsId: 'github',
-                        variable: 'GITHUB_TOKEN'
-                    )
-                ]) {
-
+                withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
                     sh '''
                         set -e
-
-                        echo "Updating Kubernetes deployment image tag..."
-
+                        git config --global --add safe.directory '*'
                         git config user.email "affan2310@users.noreply.github.com"
-                        git config user.name "Affan2310"
+                        git config user.name  "Affan2310"
 
-                        DEPLOYMENT_FILE="${APP_DIR}-manifests/deployment.yml"
+                        REPO_URL="https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"
 
-                        echo "Deployment file:"
-                        echo "${DEPLOYMENT_FILE}"
+                        # Start from the latest main so the push isn't rejected
+                        git fetch "${REPO_URL}" main
+                        git checkout -B main FETCH_HEAD
 
-                        echo ""
-                        echo "Before update:"
-                        grep -n "image:" "${DEPLOYMENT_FILE}" || true
+                        echo "Before:"; grep -n "image:" "${DEPLOYMENT_FILE}"
 
-                        sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" "${DEPLOYMENT_FILE}"
+                        # Replace whatever tag is there (works on every build, not just the first)
+                        sed -i -E "s|(image:[[:space:]]*).*ultimate-cicd:.*|\\1${DOCKER_IMAGE}|" "${DEPLOYMENT_FILE}"
 
-                        echo ""
-                        echo "After update:"
-                        grep -n "image:" "${DEPLOYMENT_FILE}" || true
+                        echo "After:";  grep -n "image:" "${DEPLOYMENT_FILE}"
 
                         git add "${DEPLOYMENT_FILE}"
-
-                        git commit \
-                            -m "Update deployment image to version ${BUILD_NUMBER}" \
-                            || echo "No changes to commit."
-
-                        git push \
-                            https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git \
-                            HEAD:main
-
-                        echo ""
-                        echo "GitOps repository updated successfully."
+                        if git diff --cached --quiet; then
+                            echo "No changes to commit."
+                        else
+                            git commit -m "Update deployment image to ${BUILD_NUMBER} [skip ci]"
+                            git push "${REPO_URL}" main
+                        fi
                     '''
                 }
             }
         }
     }
 
-
-    // =============================================================
-    // POST ACTIONS
-    // =============================================================
     post {
-
-        success {
-            echo '''
-            ==========================================
-            Jenkins Pipeline Completed Successfully
-            ==========================================
-            Application Build       : SUCCESS
-            Unit Tests              : SUCCESS
-            SonarQube Analysis      : SUCCESS
-            Docker Build            : SUCCESS
-            Docker Push             : SUCCESS
-            GitOps Update           : SUCCESS
-
-            Argo CD should now detect the
-            GitOps repository change and
-            synchronize the Kubernetes deployment.
-            ==========================================
-            '''
-        }
-
-        failure {
-            echo '''
-            ==========================================
-            Jenkins Pipeline FAILED
-            ==========================================
-            Check the failed stage above.
-            ==========================================
-            '''
-        }
-
         always {
+            // Files were created as root inside the container; give them back to the workspace owner
+            sh 'chown -R $(stat -c "%u:%g" .) . || true'
             echo "Pipeline finished: ${currentBuild.currentResult}"
+        }
+        success {
+            echo "Image ${DOCKER_IMAGE} pushed and GitOps manifest updated. Argo CD will sync it."
         }
     }
 }
