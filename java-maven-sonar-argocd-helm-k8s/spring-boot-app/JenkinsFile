@@ -2,11 +2,9 @@ pipeline {
 
     agent {
         docker {
-            // >>> CHANGE YOUR_DOCKERHUB_USER to your Docker Hub username <<<
-            image 'YOUR_DOCKERHUB_USER/maven-docker-agent:v1'
+            image 'affan2310/maven-docker-agent:v1'
             registryUrl 'https://index.docker.io/v1/'
-            registryCredentialsId 'docker-cred'   // lets Jenkins pull even if the repo is private
-            // --entrypoint='' : let Jenkins control the container (fixes ENTRYPOINT warning)
+            registryCredentialsId 'docker-cred'
             args "--user root --entrypoint='' -v /var/run/docker.sock:/var/run/docker.sock"
             reuseNode true
         }
@@ -19,11 +17,9 @@ pipeline {
         // SonarQube - prefer the EC2 PRIVATE IP (run `hostname -I` on the EC2)
         SONAR_URL = 'http://13.203.76.118:9000'
 
-        // >>> CHANGE THIS to your own Docker Hub username <<<
-        DOCKERHUB_USER = 'YOUR_DOCKERHUB_USER'
+        DOCKERHUB_USER = 'affan2310'
         DOCKER_IMAGE   = "${DOCKERHUB_USER}/ultimate-cicd:${BUILD_NUMBER}"
 
-        // GitHub (GitOps repo)
         GIT_REPO_NAME = 'Jenkins-Zero-To-Hero'
         GIT_USER_NAME = 'Affan2310'
     }
@@ -38,7 +34,6 @@ pipeline {
                     userRemoteConfigs: [[url: "https://github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"]]
                 ])
                 sh '''
-                    # Container runs as root, workspace is owned by jenkins -> trust it
                     git config --global --add safe.directory '*'
                     git rev-parse --short HEAD
                     java -version
@@ -63,13 +58,10 @@ pipeline {
                     sh '''
                         set -e
                         cd ${APP_DIR}
-
-                        echo "Checking SonarQube connectivity..."
                         if command -v curl >/dev/null 2>&1; then
                             curl -s --max-time 10 ${SONAR_URL}/api/system/status || echo "WARN: SonarQube not reachable via curl"
                         fi
                         echo ""
-
                         mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
                           -Dsonar.host.url=${SONAR_URL} \
                           -Dsonar.token=${SONAR_AUTH_TOKEN}
@@ -110,15 +102,11 @@ pipeline {
 
                         REPO_URL="https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"
 
-                        # Start from the latest main so the push isn't rejected
                         git fetch "${REPO_URL}" main
                         git checkout -B main FETCH_HEAD
 
                         echo "Before:"; grep -n "image:" "${DEPLOYMENT_FILE}"
-
-                        # Replace whatever tag is there (works on every build, not just the first)
                         sed -i -E "s|(image:[[:space:]]*).*ultimate-cicd:.*|\\1${DOCKER_IMAGE}|" "${DEPLOYMENT_FILE}"
-
                         echo "After:";  grep -n "image:" "${DEPLOYMENT_FILE}"
 
                         git add "${DEPLOYMENT_FILE}"
@@ -136,8 +124,11 @@ pipeline {
 
     post {
         always {
-            // Files were created as root inside the container; give them back to the workspace owner
-            sh 'chown -R $(stat -c "%u:%g" .) . || true'
+            script {
+                if (env.WORKSPACE) {
+                    sh 'chown -R $(stat -c "%u:%g" .) . || true'
+                }
+            }
             echo "Pipeline finished: ${currentBuild.currentResult}"
         }
         success {
